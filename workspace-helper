@@ -1,0 +1,555 @@
+#!/usr/bin/env python3
+"""選擇多個資料夾，組成 VS Code / Cursor 的 .code-workspace，並存到指定位置。"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+
+VERSION = "1.0.0"
+
+PICK_FOLDERS_SCRIPT = """
+on run argv
+    set promptText to item 1 of argv
+    set startLocation to (POSIX file (item 2 of argv)) as alias
+    set theFolders to choose folder with prompt promptText default location startLocation with multiple selections allowed
+    if class of theFolders is not list then
+        set theFolders to {theFolders}
+    end if
+    set posixPaths to {}
+    repeat with f in theFolders
+        set end of posixPaths to POSIX path of (contents of f)
+    end repeat
+    set AppleScript's text item delimiters to linefeed
+    return posixPaths as text
+end run
+""".strip()
+
+PICK_OUTPUT_SCRIPT = """
+on run argv
+    set promptText to item 1 of argv
+    set defaultName to item 2 of argv
+    set defaultLocation to (POSIX file (item 3 of argv)) as alias
+    set theFile to choose file name with prompt promptText default name defaultName default location defaultLocation
+    return POSIX path of theFile
+end run
+""".strip()
+
+EDITORS = {
+    "cursor": "Cursor",
+    "code": "Visual Studio Code",
+}
+
+
+class UserCancelled(Exception):
+    """使用者關閉選擇視窗或中斷操作。"""
+
+
+class WorkspaceError(Exception):
+    """無法完成工作區檔的輸入或寫入。"""
+
+
+def main(argv: list[str] | None = None) -> int:
+    try:
+        return run(argv)
+    except UserCancelled:
+        print("已取消。", file=sys.stderr)
+        return 1
+    except WorkspaceError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\n已取消。", file=sys.stderr)
+        return 1
+
+
+def run(argv: list[str] | None) -> int:
+    args = parse_args(argv)
+    filename = default_filename(args.name)
+    interactive = args.pick or sys.stdin.isatty()
+
+    requested = [normalize_dir(raw) for raw in args.folders]
+    folders = dedupe(requested)
+    note_duplicates(len(requested), len(folders))
+    picked_with_dialog = False
+    if not folders:
+        if not interactive:
+            raise WorkspaceError(
+                "請傳入至少一個資料夾，或在終端機執行以開啟選擇視窗。"
+            )
+        folders = pick_folders(
+            "選擇要加入工作區的資料夾（按 Command 可多選）",
+            picker_start(),
+        )
+        picked_with_dialog = True
+
+    if picked_with_dialog and sys.stdin.isatty():
+        folders = review_folders(folders)
+    if not folders:
+        raise WorkspaceError("至少需要一個資料夾。")
+    folders = dedupe(folders)
+
+    confirmed_by_dialog = False
+    if args.output:
+        output = resolve_output(args.output, filename)
+    else:
+        if not interactive:
+            raise WorkspaceError("請用 -o 指定 .code-workspace 的儲存位置。")
+        chosen = pick_output(filename, suggest_directory(folders))
+        output = resolve_output(chosen, filename)
+        confirmed_by_dialog = same_path(chosen, output)
+
+    document = build_document(folders, output, absolute=args.absolute)
+    content = render(document)
+
+    if args.dry_run:
+        print("預覽工作區內容，尚未寫入檔案。", file=sys.stderr)
+        sys.stdout.write(content)
+        return 0
+
+    write_workspace(
+        output,
+        content,
+        overwrite=args.yes,
+        confirmed_by_dialog=confirmed_by_dialog,
+    )
+    print_summary(output, document)
+
+    interactive_session = picked_with_dialog or args.output is None
+    opener = resolve_opener(args.open, interactive_session)
+    if opener:
+        open_workspace(output, opener)
+        print(f"已用 {EDITORS[opener]} 開啟。")
+    return 0
+
+
+def parse_args(argv: list[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="workspace-helper",
+        description="選擇多個資料夾，組成 VS Code 的 .code-workspace，並存到指定位置。",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+範例：
+  workspace-helper
+  workspace-helper ~/repo/api ~/repo/web -o ~/Desktop/dev.code-workspace
+  workspace-helper --absolute -o ~/Desktop/ ~/repo/api ~/repo/web
+  workspace-helper --open cursor -y -o ./team.code-workspace ./api ./web
+
+直接執行時會開啟 macOS 資料夾選擇視窗，可按 Command 多選。
+接著選擇要把 .code-workspace 存到哪裡。
+工作區內的路徑預設會寫成相對於這個檔案的路徑。
+""".strip(),
+    )
+    parser.add_argument(
+        "folders",
+        nargs="*",
+        metavar="FOLDER",
+        help="要加入的資料夾；省略時會開啟選擇視窗",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        help="儲存位置，可以是檔案路徑或目錄",
+    )
+    parser.add_argument(
+        "-n",
+        "--name",
+        default="workspace",
+        help="存到目錄、或選擇視窗使用的檔名，預設 workspace",
+    )
+    parser.add_argument(
+        "--absolute",
+        action="store_true",
+        help="在工作區檔裡寫絕對路徑（預設為相對路徑）",
+    )
+    parser.add_argument(
+        "--open",
+        choices=["cursor", "code", "ask", "none"],
+        help="寫入後用 Cursor 或 VS Code 開啟",
+    )
+    parser.add_argument(
+        "--pick",
+        action="store_true",
+        help="即使不是互動終端，也開啟資料夾與儲存位置選擇視窗",
+    )
+    parser.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="若檔案已存在，直接覆寫",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="只把工作區內容印到終端，不寫入檔案",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"workspace-helper {VERSION}",
+    )
+    return parser.parse_args(argv)
+
+
+def default_filename(name: str) -> str:
+    filename = name.strip()
+    if not filename or filename in {".", ".."} or "/" in filename:
+        raise WorkspaceError(f"檔名無效：{name}")
+    if not filename.endswith(".code-workspace"):
+        filename += ".code-workspace"
+    return filename
+
+
+def normalize_dir(raw: str) -> Path:
+    text = clean_path_text(raw)
+    if not text:
+        raise WorkspaceError("路徑是空的。")
+    path = Path(text).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    path = Path(os.path.normpath(path))
+    if not path.exists():
+        raise WorkspaceError(f"找不到資料夾：{path}")
+    if not path.is_dir():
+        raise WorkspaceError(f"這不是資料夾：{path}")
+    return path
+
+
+def resolve_output(raw: str, filename: str) -> Path:
+    text = clean_path_text(raw)
+    if not text:
+        raise WorkspaceError("請指定儲存位置。")
+    wants_directory = text.endswith("/")
+    path = Path(text).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    path = Path(os.path.normpath(path))
+    if wants_directory or path.is_dir():
+        if not path.is_dir():
+            raise WorkspaceError(f"找不到目錄：{path}")
+        path = path / filename
+    elif not path.name.endswith(".code-workspace"):
+        path = path.with_name(path.name + ".code-workspace")
+    if not path.parent.is_dir():
+        raise WorkspaceError(f"找不到目錄：{path.parent}")
+    return path
+
+
+def clean_path_text(raw: str) -> str:
+    text = raw.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {'"', "'"}:
+        text = text[1:-1]
+    return text.strip()
+
+
+def dedupe(paths: list[Path]) -> list[Path]:
+    seen: set[str] = set()
+    unique: list[Path] = []
+    for path in paths:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(path)
+    return unique
+
+
+def note_duplicates(before: int, after: int) -> None:
+    skipped = before - after
+    if skipped > 0:
+        print(f"已略過 {skipped} 個重複的資料夾。", file=sys.stderr)
+
+
+def merge_folders(existing: list[Path], extra: list[Path]) -> list[Path]:
+    merged = dedupe(existing + extra)
+    note_duplicates(len(existing) + len(extra), len(merged))
+    return merged
+
+
+def same_path(raw: str, path: Path) -> bool:
+    text = clean_path_text(raw)
+    if not text:
+        return False
+    candidate = Path(text).expanduser()
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+    return Path(os.path.normpath(candidate)) == path
+
+
+def picker_start() -> Path:
+    current = Path.cwd()
+    if current.is_dir() and current != Path("/"):
+        return current
+    return Path.home()
+
+
+def suggest_directory(folders: list[Path]) -> Path:
+    desktop = Path.home() / "Desktop"
+    fallback = desktop if desktop.is_dir() else Path.home()
+    if len(folders) == 1:
+        parent = folders[0].parent
+        return parent if parent.is_dir() else fallback
+    try:
+        common = Path(os.path.commonpath([str(folder) for folder in folders]))
+    except ValueError:
+        return fallback
+    if common.is_dir():
+        return common
+    return fallback
+
+
+def pick_folders(prompt_text: str, start: Path) -> list[Path]:
+    if not start.is_dir():
+        start = Path.home()
+    raw = run_osascript(PICK_FOLDERS_SCRIPT, [prompt_text, str(start)])
+    selected = [line.strip() for line in raw.splitlines() if line.strip()]
+    if not selected:
+        raise WorkspaceError("沒有選擇任何資料夾。")
+    return dedupe([normalize_dir(line) for line in selected])
+
+
+def pick_output(filename: str, start: Path) -> str:
+    if not start.is_dir():
+        start = Path.home()
+    return run_osascript(
+        PICK_OUTPUT_SCRIPT,
+        [
+            "選擇 .code-workspace 的儲存位置",
+            filename,
+            str(start),
+        ],
+    )
+
+
+def run_osascript(script: str, args: list[str]) -> str:
+    try:
+        result = subprocess.run(
+            ["osascript", "-", *args],
+            input=script,
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+        )
+    except FileNotFoundError as exc:
+        raise WorkspaceError("找不到 osascript，無法開啟選擇視窗。") from exc
+    if result.returncode != 0:
+        err = (result.stderr or "").strip()
+        lowered = err.lower()
+        if "-128" in err or "canceled" in lowered or "cancelled" in lowered:
+            raise UserCancelled()
+        detail = f"\n{err}" if err else ""
+        raise WorkspaceError(f"無法開啟選擇視窗。{detail}")
+    return result.stdout.strip()
+
+
+def review_folders(folders: list[Path]) -> list[Path]:
+    while True:
+        print()
+        print(f"已選擇 {len(folders)} 個資料夾：")
+        if folders:
+            for index, folder in enumerate(folders, start=1):
+                print(f"  {index}. {folder}")
+        else:
+            print("  （尚未選擇）")
+        print()
+        print("[Enter] 繼續    [a] 再加入    [r] 移除    [t] 輸入路徑    [q] 取消")
+        choice = prompt("> ").strip().lower()
+        if choice in {"", "c", "y"}:
+            if not folders:
+                print("至少需要一個資料夾。")
+                continue
+            return folders
+        if choice in {"q", "quit", "exit"}:
+            raise UserCancelled()
+        if choice == "a":
+            try:
+                added = pick_folders(
+                    "再選擇要加入的資料夾（按 Command 可多選）",
+                    picker_start(),
+                )
+            except UserCancelled:
+                print("沒有加入新的資料夾。")
+                continue
+            folders = merge_folders(folders, added)
+            continue
+        if choice == "t":
+            typed = prompt("資料夾路徑：")
+            if not typed.strip():
+                continue
+            try:
+                folders = merge_folders(folders, [normalize_dir(typed)])
+            except WorkspaceError as exc:
+                print(exc)
+            continue
+        if choice == "r":
+            if not folders:
+                print("目前沒有可以移除的資料夾。")
+                continue
+            raw = prompt("要移除的編號（例如 1,3）：")
+            try:
+                indexes = parse_indexes(raw, len(folders))
+            except WorkspaceError as exc:
+                print(exc)
+                continue
+            folders = [
+                folder
+                for index, folder in enumerate(folders, start=1)
+                if index not in indexes
+            ]
+            continue
+        print("請輸入 Enter、a、r、t 或 q。")
+
+
+def parse_indexes(raw: str, size: int) -> set[int]:
+    tokens = raw.replace("，", " ").replace(",", " ").split()
+    if not tokens:
+        raise WorkspaceError("請輸入編號。")
+    indexes: set[int] = set()
+    for token in tokens:
+        if not token.isdigit():
+            raise WorkspaceError(f"無法辨識的編號：{token}")
+        number = int(token)
+        if number < 1 or number > size:
+            raise WorkspaceError(f"編號超出範圍：{number}")
+        indexes.add(number)
+    return indexes
+
+
+def prompt(text: str) -> str:
+    try:
+        return input(text)
+    except EOFError as exc:
+        raise UserCancelled() from exc
+
+
+def build_document(folders: list[Path], output: Path, absolute: bool) -> dict:
+    names = unique_names(folders)
+    entries = []
+    for folder, name in zip(folders, names):
+        entries.append(
+            {
+                "path": folder_path(folder, output.parent, absolute),
+                "name": name,
+            }
+        )
+    return {"folders": entries, "settings": {}}
+
+
+def folder_path(folder: Path, workspace_dir: Path, absolute: bool) -> str:
+    if absolute:
+        return folder.as_posix()
+    try:
+        relative = os.path.relpath(folder, workspace_dir)
+    except ValueError:
+        return folder.as_posix()
+    return Path(relative).as_posix()
+
+
+def unique_names(paths: list[Path]) -> list[str]:
+    part_lists = [significant_parts(path) for path in paths]
+    longest = max((len(parts) for parts in part_lists), default=1)
+    for length in range(1, longest + 1):
+        labels = [
+            "/".join(parts[-length:]) if parts else path.as_posix()
+            for parts, path in zip(part_lists, paths)
+        ]
+        if len(set(labels)) == len(labels):
+            return labels
+    return [path.as_posix() for path in paths]
+
+
+def significant_parts(path: Path) -> list[str]:
+    return [part for part in path.parts if part not in {"/", ""}]
+
+
+def render(document: dict) -> str:
+    return json.dumps(document, indent="\t", ensure_ascii=False) + "\n"
+
+
+def write_workspace(
+    path: Path,
+    content: str,
+    overwrite: bool,
+    confirmed_by_dialog: bool,
+) -> None:
+    if not path.parent.is_dir():
+        raise WorkspaceError(f"找不到目錄：{path.parent}")
+    if path.exists() and not path.is_file():
+        raise WorkspaceError(f"儲存位置不是檔案：{path}")
+    if path.exists() and not overwrite and not confirmed_by_dialog:
+        if not sys.stdin.isatty():
+            raise WorkspaceError(f"檔案已存在：{path}（加上 --yes 可覆寫）")
+        answer = prompt(f"檔案已存在，要覆寫嗎？ {path} [y/N] ").strip().lower()
+        if answer not in {"y", "yes"}:
+            raise UserCancelled()
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(content, encoding="utf-8")
+        temporary.replace(path)
+    except OSError as exc:
+        raise WorkspaceError(f"無法寫入檔案：{path}\n{exc}") from exc
+    finally:
+        if temporary.exists():
+            temporary.unlink(missing_ok=True)
+
+
+def print_summary(path: Path, document: dict) -> None:
+    folders = document["folders"]
+    print()
+    print(f"已寫入 {path}")
+    print(f"包含 {len(folders)} 個資料夾：")
+    for folder in folders:
+        print(f"  • {folder['name']}  →  {folder['path']}")
+
+
+def resolve_opener(option: str | None, interactive_session: bool) -> str | None:
+    if option in {"cursor", "code"}:
+        return option
+    if option == "none" or not sys.stdin.isatty():
+        return None
+    if option == "ask" or (option is None and interactive_session):
+        return ask_opener()
+    return None
+
+
+def ask_opener() -> str | None:
+    print()
+    print("要開啟這個工作區嗎？  [c] Cursor    [v] VS Code    [Enter] 先不開啟")
+    try:
+        choice = input("> ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+    if choice in {"", "n", "no"}:
+        return None
+    if choice in {"c", "cursor"}:
+        return "cursor"
+    if choice in {"v", "code", "vscode"}:
+        return "code"
+    print("沒有開啟。")
+    return None
+
+
+def open_workspace(path: Path, editor: str) -> None:
+    app_name = EDITORS[editor]
+    result = subprocess.run(
+        ["open", "-a", app_name, str(path)],
+        text=True,
+        encoding="utf-8",
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        message = f"無法用 {app_name} 開啟。"
+        if detail:
+            message = f"{message}\n{detail}"
+        raise WorkspaceError(message)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
